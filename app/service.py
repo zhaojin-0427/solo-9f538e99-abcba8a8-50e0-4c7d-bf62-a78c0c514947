@@ -11,7 +11,10 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
+import json
+import logging
 import math
 import sqlite3
 import threading
@@ -25,6 +28,8 @@ import anyio
 from . import storage
 from .config import Settings, settings as default_settings
 from .db import connect, metadata_lock, transaction
+
+logger = logging.getLogger("moisture.service")
 
 
 class ServiceError(Exception):
@@ -45,6 +50,18 @@ class SnapshotReleased(ServiceError):
 
 class MissingBlobFile(ServiceError):
     """登记在册的 blob 在数据卷上缺失（数据卷损坏）。"""
+
+
+class UploadNotFound(ServiceError):
+    """续传上传号不存在。"""
+
+
+class UploadConflict(ServiceError):
+    """续传请求与当前状态冲突（跳写/异文/超总长/过期/已完成），进度不变。"""
+
+
+class ChecksumMismatch(ServiceError):
+    """到齐后计算出的 SHA-256 与创建时声明的不一致。"""
 
 
 def _utcnow() -> datetime:
@@ -126,17 +143,30 @@ class MoistureService:
         # 活动下载流的强引用集合，防止异步生成器在响应结束前被 GC
         # （否则其 finally 会提前释放租约）
         self._active_streams: set = set()
+        # 每个续传上传一把串行锁：同一上传号的分片追加按序处理，
+        # 避免并发分片互相破坏“已确认偏移”语义。
+        self._upload_locks: Dict[str, threading.Lock] = {}
+        self._upload_locks_guard = threading.Lock()
 
     # -- 基础工具 ---------------------------------------------------------- #
     def _conn(self) -> sqlite3.Connection:
         return connect(self.cfg)
 
+    def _upload_lock(self, upload_id: str) -> threading.Lock:
+        with self._upload_locks_guard:
+            lock = self._upload_locks.get(upload_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._upload_locks[upload_id] = lock
+            return lock
+
     def startup(self) -> None:
-        """建表、清理过期临时文件、恢复未完成的回收。"""
+        """建表、清理过期临时文件、恢复续传状态、恢复未完成的回收。"""
         from .db import init_db
 
         init_db(self.cfg)
         self._cleanup_tmp()
+        self._recover_resumable_uploads()
         self.reconcile_disk()
         self.run_gc()
 
@@ -147,6 +177,72 @@ class MoistureService:
         for p in tmp.iterdir():
             if p.is_file():
                 p.unlink(missing_ok=True)
+
+    def _recover_resumable_uploads(self) -> None:
+        """重启后恢复续传状态。
+
+        数据库里的 ``confirmed_bytes`` 是唯一权威进度；暂存文件中超出它的
+        尾部是上次崩溃/断连时未确认的字节，一律截断丢弃，不计入进度。
+        暂存文件丢失则回到 0 偏移，客户端可从头重传。已完成（或无登记）的
+        孤儿暂存文件（例如完成提交后清理失败）直接删除。
+        """
+        with metadata_lock:
+            conn = self._conn()
+            try:
+                rows = conn.execute(
+                    "SELECT upload_id, confirmed_bytes FROM resumable_uploads"
+                    " WHERE status = 'open'"
+                ).fetchall()
+                open_ids = {row["upload_id"] for row in rows}
+                for row in rows:
+                    upload_id = row["upload_id"]
+                    confirmed = row["confirmed_bytes"]
+                    path = storage.partial_path(upload_id, self.cfg)
+                    try:
+                        if not path.exists():
+                            logger.warning(
+                                "续传 %s 的暂存文件丢失，进度回退到 0", upload_id
+                            )
+                            with transaction(conn):
+                                conn.execute(
+                                    "UPDATE resumable_uploads SET confirmed_bytes = 0,"
+                                    " updated_at = ? WHERE upload_id = ?",
+                                    (_iso(_utcnow()), upload_id),
+                                )
+                            storage.create_partial(upload_id, self.cfg)
+                            continue
+                        storage.truncate_partial(upload_id, confirmed, self.cfg)
+                    except Exception:
+                        logger.exception("恢复续传 %s 失败", upload_id)
+                        raise
+
+                # 清扫孤儿暂存文件：不属于任何 open 上传（已完成/无登记）
+                uploads_dir = self.cfg.uploads_dir
+                if uploads_dir.exists():
+                    for p in uploads_dir.glob("upload-*.part"):
+                        uid = p.name[len("upload-"):-len(".part")]
+                        if uid not in open_ids:
+                            p.unlink(missing_ok=True)
+            finally:
+                conn.close()
+
+    # -- 分区“代”：用于续传的过期判定 ------------------------------------- #
+    def _get_generation(self, conn: sqlite3.Connection, partition_id: str) -> int:
+        row = conn.execute(
+            "SELECT generation FROM partition_generations WHERE partition_id = ?",
+            (partition_id,),
+        ).fetchone()
+        return row["generation"] if row is not None else 0
+
+    def _bump_generation(self, conn: sqlite3.Connection, partition_id: str) -> int:
+        """分区被成功发布（普通上传/续传完成）时代计数 +1，返回新代。"""
+        gen = self._get_generation(conn, partition_id) + 1
+        conn.execute(
+            "INSERT INTO partition_generations(partition_id, generation) VALUES (?, ?)"
+            " ON CONFLICT(partition_id) DO UPDATE SET generation = excluded.generation",
+            (partition_id, gen),
+        )
+        return gen
 
     # -- 引用判定（必须在 metadata_lock 下调用） --------------------------- #
     def _is_referenced(self, conn: sqlite3.Connection, sha: str) -> bool:
@@ -219,62 +315,15 @@ class MoistureService:
             with open(tmp_path, "rb") as fh:
                 rows = parse_csv_bytes(fh.read())
 
-            now = _iso(_utcnow())
             with metadata_lock:
                 conn = self._conn()
                 try:
                     with transaction(conn):
-                        # 登记 blob（若同 SHA 已存在则复用，实现数据卷共用）
-                        existing = conn.execute(
-                            "SELECT 1 FROM blobs WHERE sha256 = ?", (sha,)
-                        ).fetchone()
-                        if existing:
-                            # 同内容重新上传/仍被引用：取消任何待回收记录
-                            conn.execute("DELETE FROM gc_queue WHERE sha256 = ?", (sha,))
-                        else:
-                            conn.execute(
-                                "INSERT INTO blobs(sha256, size, created_at) VALUES (?, ?, ?)",
-                                (sha, size, now),
-                            )
-                        storage.publish_blob(tmp_path, sha, self.cfg)
-                        published = True
-
-                        old = conn.execute(
-                            "SELECT current_blob FROM partitions WHERE partition_id = ?",
-                            (partition_id,),
-                        ).fetchone()
-                        replaced = old is not None
-                        if old is None:
-                            conn.execute(
-                                "INSERT INTO partitions(partition_id, current_blob,"
-                                " row_count, created_at, updated_at)"
-                                " VALUES (?, ?, ?, ?, ?)",
-                                (partition_id, sha, len(rows), now, now),
-                            )
-                        else:
-                            conn.execute(
-                                "UPDATE partitions SET current_blob = ?, row_count = ?,"
-                                " updated_at = ? WHERE partition_id = ?",
-                                (sha, len(rows), now, partition_id),
-                            )
-                            conn.execute(
-                                "DELETE FROM partition_entries WHERE partition_id = ?",
-                                (partition_id,),
-                            )
-                        conn.executemany(
-                            "INSERT INTO partition_entries(partition_id, row_index,"
-                            " station, moisture, blob_sha) VALUES (?, ?, ?, ?, ?)",
-                            [
-                                (partition_id, i, r["station"], r["moisture"], sha)
-                                for i, r in enumerate(rows)
-                            ],
+                        result = self._publish_partition(
+                            conn, partition_id, tmp_path, sha, size, rows
                         )
-                        orphaned: List[str] = []
-                        if old is not None and old["current_blob"]:
-                            old_sha = old["current_blob"]
-                            if old_sha != sha and not self._is_referenced(conn, old_sha):
-                                orphaned.append(old_sha)
-                        self._enqueue_gc(conn, orphaned)
+                        published = result["blob_published"]
+                        replaced = result["replaced"]
                 finally:
                     conn.close()
         finally:
@@ -288,6 +337,348 @@ class MoistureService:
             "row_count": len(rows),
             "replaced": replaced,
         }
+
+    def _publish_partition(
+        self,
+        conn: sqlite3.Connection,
+        partition_id: str,
+        source_path: Path,
+        sha: str,
+        size: int,
+        rows: List[Dict[str, object]],
+    ) -> Dict[str, object]:
+        """在调用方事务内登记 blob、原子发布并整份替换分区（含行索引）。
+
+        普通上传与续传完成共用同一发布路径，保证“一次性发布分区、行索引”。
+        旧版本 blob 若不再被任何当前分区/未释放快照引用则进入回收队列。
+        返回 replaced 与 blob_published（用于失败时清理临时文件）。
+        """
+        now = _iso(_utcnow())
+        existing = conn.execute(
+            "SELECT 1 FROM blobs WHERE sha256 = ?", (sha,)
+        ).fetchone()
+        if existing:
+            # 同内容重新上传/仍被引用：取消任何待回收记录
+            conn.execute("DELETE FROM gc_queue WHERE sha256 = ?", (sha,))
+        else:
+            conn.execute(
+                "INSERT INTO blobs(sha256, size, created_at) VALUES (?, ?, ?)",
+                (sha, size, now),
+            )
+        storage.publish_blob(source_path, sha, self.cfg)
+        blob_published = True
+
+        old = conn.execute(
+            "SELECT current_blob FROM partitions WHERE partition_id = ?",
+            (partition_id,),
+        ).fetchone()
+        replaced = old is not None
+        if old is None:
+            conn.execute(
+                "INSERT INTO partitions(partition_id, current_blob,"
+                " row_count, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (partition_id, sha, len(rows), now, now),
+            )
+        else:
+            conn.execute(
+                "UPDATE partitions SET current_blob = ?, row_count = ?,"
+                " updated_at = ? WHERE partition_id = ?",
+                (sha, len(rows), now, partition_id),
+            )
+            conn.execute(
+                "DELETE FROM partition_entries WHERE partition_id = ?",
+                (partition_id,),
+            )
+        conn.executemany(
+            "INSERT INTO partition_entries(partition_id, row_index,"
+            " station, moisture, blob_sha) VALUES (?, ?, ?, ?, ?)",
+            [
+                (partition_id, i, r["station"], r["moisture"], sha)
+                for i, r in enumerate(rows)
+            ],
+        )
+        # 任何成功发布都推进分区代计数：创建于本次发布之前的续传即告过期
+        self._bump_generation(conn, partition_id)
+
+        orphaned: List[str] = []
+        if old is not None and old["current_blob"]:
+            old_sha = old["current_blob"]
+            if old_sha != sha and not self._is_referenced(conn, old_sha):
+                orphaned.append(old_sha)
+        self._enqueue_gc(conn, orphaned)
+        return {"replaced": replaced, "blob_published": blob_published}
+
+    # -- 断点续传 ---------------------------------------------------------- #
+    def create_resumable_upload(
+        self, partition_id: str, total_bytes: int, sha256_expected: str
+    ) -> Dict[str, object]:
+        """创建续传上传：指定日期分区、总字节数与整文件 SHA-256。
+
+        返回上传号与已确认偏移（新建为 0）。上传大小沿用全局
+        ``MAX_UPLOAD_BYTES`` 限制；SHA-256 必须是 64 位十六进制。
+        """
+        if not isinstance(total_bytes, int) or total_bytes <= 0:
+            raise UploadConflict("total_bytes 必须是正整数")
+        if total_bytes > self.cfg.max_upload_bytes:
+            raise storage.UploadTooLarge(
+                f"upload exceeds {self.cfg.max_upload_bytes} bytes"
+            )
+        sha = (sha256_expected or "").strip().lower()
+        if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
+            raise UploadConflict("sha256 必须是 64 位十六进制字符串")
+
+        upload_id = uuid.uuid4().hex
+        now = _iso(_utcnow())
+        with metadata_lock:
+            conn = self._conn()
+            try:
+                with transaction(conn):
+                    generation = self._get_generation(conn, partition_id)
+                    conn.execute(
+                        "INSERT INTO resumable_uploads(upload_id, partition_id,"
+                        " total_bytes, sha256_expected, confirmed_bytes,"
+                        " created_generation, status, created_at, updated_at)"
+                        " VALUES (?, ?, ?, ?, 0, ?, 'open', ?, ?)",
+                        (
+                            upload_id, partition_id, total_bytes, sha,
+                            generation, now, now,
+                        ),
+                    )
+                # 暂存文件在事务外创建：失败则删除登记，保持两者一致
+                try:
+                    storage.create_partial(upload_id, self.cfg)
+                except Exception:
+                    with metadata_lock:
+                        with transaction(conn):
+                            conn.execute(
+                                "DELETE FROM resumable_uploads WHERE upload_id = ?",
+                                (upload_id,),
+                            )
+                    raise
+            finally:
+                conn.close()
+        return {
+            "upload_id": upload_id,
+            "partition_id": partition_id,
+            "total_bytes": total_bytes,
+            "sha256_expected": sha,
+            "confirmed_bytes": 0,
+            "remaining_bytes": total_bytes,
+            "status": "open",
+            "created_at": now,
+        }
+
+    def _get_open_upload(self, conn, upload_id: str) -> sqlite3.Row:
+        row = conn.execute(
+            "SELECT * FROM resumable_uploads WHERE upload_id = ?", (upload_id,)
+        ).fetchone()
+        if row is None:
+            raise UploadNotFound(f"上传号 {upload_id} 不存在")
+        if row["status"] != "open":
+            raise UploadConflict(f"上传 {upload_id} 已完成，不能再追加字节")
+        return row
+
+    def append_resumable_upload(
+        self, upload_id: str, offset: int, chunk: bytes
+    ) -> Dict[str, object]:
+        """按偏移追加字节。
+
+        - 同字节重传已确认区间：幂等，不重复追加，返回同一确认偏移；
+        - 跳写（offset > 已确认偏移）或异文重传：拒绝（409），不改进度；
+        - 未确认尾部在重启后被截断，确认偏移只由本方法在事务内推进。
+        """
+        if not isinstance(offset, int) or offset < 0:
+            raise UploadConflict("offset 必须是非负整数")
+
+        # 同一上传号串行：保证“读确认偏移 → 写文件 → 更新偏移”原子可见
+        with self._upload_lock(upload_id):
+            with metadata_lock:
+                conn = self._conn()
+                try:
+                    upload = self._get_open_upload(conn, upload_id)
+                    confirmed = upload["confirmed_bytes"]
+                    total_bytes = upload["total_bytes"]
+                    partial = storage.partial_path(upload_id, self.cfg)
+                    if not partial.exists():
+                        # 暂存文件被外部清理：回到 0 偏移，客户端可从头重传，
+                        # 已确认进度无法凭空保留（文件字节已丢失）。
+                        with transaction(conn):
+                            conn.execute(
+                                "UPDATE resumable_uploads SET confirmed_bytes = 0,"
+                                " updated_at = ? WHERE upload_id = ?",
+                                (_iso(_utcnow()), upload_id),
+                            )
+                        storage.create_partial(upload_id, self.cfg)
+                        raise UploadConflict(
+                            "暂存文件缺失，已确认进度回退到 0，请从头重传"
+                        )
+                    try:
+                        new_confirmed = storage.append_partial(
+                            upload_id,
+                            offset,
+                            chunk,
+                            confirmed,
+                            total_bytes,
+                            self.cfg.max_upload_bytes,
+                            self.cfg,
+                        )
+                    except (
+                        storage.PartialOffsetError,
+                        storage.PartialConflictError,
+                        storage.PartialOverrunError,
+                    ) as exc:
+                        raise UploadConflict(str(exc)) from exc
+                    if new_confirmed != confirmed:
+                        with transaction(conn):
+                            conn.execute(
+                                "UPDATE resumable_uploads SET confirmed_bytes = ?,"
+                                " updated_at = ? WHERE upload_id = ?",
+                                (new_confirmed, _iso(_utcnow()), upload_id),
+                            )
+                    progress = self._progress_row(
+                        conn.execute(
+                            "SELECT * FROM resumable_uploads WHERE upload_id = ?",
+                            (upload_id,),
+                        ).fetchone()
+                    )
+                    return progress
+                finally:
+                    conn.close()
+
+    @staticmethod
+    def _progress_row(row: sqlite3.Row) -> Dict[str, object]:
+        return {
+            "upload_id": row["upload_id"],
+            "partition_id": row["partition_id"],
+            "total_bytes": row["total_bytes"],
+            "confirmed_bytes": row["confirmed_bytes"],
+            "remaining_bytes": row["total_bytes"] - row["confirmed_bytes"],
+            "status": row["status"],
+            "sha256_expected": row["sha256_expected"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "completed_at": row["completed_at"],
+        }
+
+    def get_resumable_upload(self, upload_id: str) -> Dict[str, object]:
+        """查进度：返回已确认偏移与剩余字节；完成后返回缓存的完成结果。"""
+        conn = self._conn()
+        try:
+            row = conn.execute(
+                "SELECT * FROM resumable_uploads WHERE upload_id = ?", (upload_id,)
+            ).fetchone()
+            if row is None:
+                raise UploadNotFound(f"上传号 {upload_id} 不存在")
+            progress = self._progress_row(row)
+            if row["status"] == "completed":
+                progress["result"] = json.loads(row["result_json"])
+            return progress
+        finally:
+            conn.close()
+
+    def list_resumable_uploads(
+        self, status: Optional[str] = None
+    ) -> List[Dict[str, object]]:
+        conn = self._conn()
+        try:
+            if status is not None:
+                rows = conn.execute(
+                    "SELECT * FROM resumable_uploads WHERE status = ?"
+                    " ORDER BY created_at",
+                    (status,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM resumable_uploads ORDER BY created_at"
+                ).fetchall()
+            return [self._progress_row(r) for r in rows]
+        finally:
+            conn.close()
+
+    def complete_resumable_upload(self, upload_id: str) -> Dict[str, object]:
+        """到齐后核验并一次性发布；重复完成幂等返回原结果。
+
+        核验顺序：状态/到齐 → 分区是否已被替换过（代计数）→ SHA-256 摘要 →
+        原 CSV 规则。任一失败都不改原分区、不改进度。成功则在同一事务里
+        登记 blob、发布文件、替换分区与行索引，并缓存结果；之后对同一上传号
+        （含重启后）重复完成永远返回缓存结果，不再覆盖后来的上传。
+        """
+        with self._upload_lock(upload_id):
+            with metadata_lock:
+                conn = self._conn()
+                try:
+                    row = conn.execute(
+                        "SELECT * FROM resumable_uploads WHERE upload_id = ?",
+                        (upload_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise UploadNotFound(f"上传号 {upload_id} 不存在")
+                    if row["status"] == "completed":
+                        # 幂等：返回首次完成时缓存的结果，不再发布
+                        return json.loads(row["result_json"])
+
+                    partition_id = row["partition_id"]
+                    total_bytes = row["total_bytes"]
+                    confirmed = row["confirmed_bytes"]
+                    if confirmed != total_bytes:
+                        raise UploadConflict(
+                            f"尚未到齐：已确认 {confirmed}/{total_bytes} 字节，"
+                            "不能完成"
+                        )
+                    # 过期判定：创建之后该日期分区被任何成功发布替换过即拒绝，
+                    # 即使新内容与本上传完全相同（甚至改回原内容）也不例外。
+                    current_generation = self._get_generation(conn, partition_id)
+                    if current_generation != row["created_generation"]:
+                        raise UploadConflict(
+                            f"分区 {partition_id} 在本上传创建后已被成功替换过，"
+                            "该上传已过期，拒绝完成"
+                        )
+
+                    partial = storage.partial_path(upload_id, self.cfg)
+                    if not partial.exists():
+                        raise MissingBlobFile(
+                            f"上传 {upload_id} 的暂存文件缺失，无法完成"
+                        )
+                    data = partial.read_bytes()
+                    if len(data) != total_bytes:
+                        raise UploadConflict(
+                            f"暂存文件长度 {len(data)} 与声明总字节 {total_bytes} 不一致"
+                        )
+                    actual_sha = hashlib.sha256(data).hexdigest()
+                    if actual_sha != row["sha256_expected"]:
+                        raise ChecksumMismatch(
+                            "SHA-256 核验失败：实际摘要与创建时声明的不一致"
+                        )
+                    # 复用原 CSV 规则；校验失败抛 CsvValidationError，原分区不动
+                    rows = parse_csv_bytes(data)
+
+                    now = _iso(_utcnow())
+                    result: Dict[str, object] = {}
+                    with transaction(conn):
+                        publish_info = self._publish_partition(
+                            conn, partition_id, partial, actual_sha, total_bytes, rows
+                        )
+                        result = {
+                            "upload_id": upload_id,
+                            "partition_id": partition_id,
+                            "sha256": actual_sha,
+                            "size": total_bytes,
+                            "row_count": len(rows),
+                            "replaced": publish_info["replaced"],
+                            "completed_at": now,
+                        }
+                        conn.execute(
+                            "UPDATE resumable_uploads SET status = 'completed',"
+                            " completed_at = ?, result_json = ?, updated_at = ?"
+                            " WHERE upload_id = ?",
+                            (now, json.dumps(result, ensure_ascii=False), now, upload_id),
+                        )
+                    # 事务提交成功后才清理暂存文件；失败则保留，可重试
+                    storage.discard_partial(upload_id, self.cfg)
+                    return result
+                finally:
+                    conn.close()
 
     # -- 快照：固定全部当前分区 ------------------------------------------- #
     def create_snapshot(self) -> Dict[str, object]:

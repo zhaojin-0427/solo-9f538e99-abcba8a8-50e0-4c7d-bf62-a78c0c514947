@@ -5,20 +5,38 @@ import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, File, HTTPException, Path as PathParam, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Path as PathParam, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
 from . import storage
 from .config import settings
 from .service import (
+    ChecksumMismatch,
     CsvValidationError,
     MissingBlobFile,
     MoistureService,
     NotFound,
     ServiceError,
     SnapshotReleased,
+    UploadConflict,
+    UploadNotFound,
 )
 from .storage import UploadTooLarge
+
+
+class ResumableCreateRequest(BaseModel):
+    """创建续传上传的请求体。"""
+
+    partition_id: str = Field(
+        ..., description="目标日期分区标识，如 2026-11-15"
+    )
+    total_bytes: int = Field(
+        ..., gt=0, description="整份 CSV 的总字节数（受 MAX_UPLOAD_BYTES 限制）"
+    )
+    sha256: str = Field(
+        ..., min_length=64, max_length=64, description="整份字节的 SHA-256（十六进制）"
+    )
 
 service = MoistureService(settings)
 
@@ -32,10 +50,12 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="土壤湿度分区内容寻址存储 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "按日期分区上传 CSV（站点、湿度），整份替换当前分区；"
-        "相同字节按 SHA-256 共用数据卷文件；支持快照固定/释放与安全回收。"
+        "相同字节按 SHA-256 共用数据卷文件；支持快照固定/释放与安全回收；"
+        "并提供断点续传上传：按偏移追加、断线/重启后从已确认偏移续传，"
+        "到齐后核验摘要并一次性发布。"
     ),
     lifespan=lifespan,
 )
@@ -46,7 +66,11 @@ def _service_error_handler(_request, exc: ServiceError):
     status = 400
     if isinstance(exc, NotFound):
         status = 404
+    elif isinstance(exc, UploadNotFound):
+        status = 404
     elif isinstance(exc, SnapshotReleased):
+        status = 409
+    elif isinstance(exc, (UploadConflict, ChecksumMismatch)):
         status = 409
     elif isinstance(exc, MissingBlobFile):
         status = 500
@@ -124,6 +148,89 @@ def download_partition(
     if snapshot_id is not None:
         headers["X-Snapshot-ID"] = str(snapshot_id)
     return StreamingResponse(stream, media_type="text/csv", headers=headers)
+
+
+# --------------------------------------------------------------------------- #
+# 断点续传上传
+# --------------------------------------------------------------------------- #
+@app.post("/resumable/uploads", status_code=201)
+def create_resumable_upload(payload: ResumableCreateRequest):
+    """创建续传上传：指定日期、总字节数和整份 SHA-256，返回上传号与已确认偏移。"""
+    try:
+        return service.create_resumable_upload(
+            payload.partition_id, payload.total_bytes, payload.sha256
+        )
+    except UploadTooLarge as exc:
+        raise HTTPException(status_code=413, detail=str(exc))
+
+
+@app.put("/resumable/uploads/{upload_id}/content")
+async def append_resumable_content(
+    upload_id: str,
+    request: Request,
+    offset: int = Query(..., ge=0, description="本块首字节在整份文件中的偏移"),
+):
+    """按偏移追加原始字节（application/octet-stream 请求体）。
+
+    - 已确认区间的同字节重传幂等，不重复追加；
+    - 跳写（offset 越过已确认偏移）或异文重传返回 409 且不改进度；
+    - 超过创建时声明的总字节数返回 409，超过全局大小限制返回 413。
+    """
+    body = await _read_request_body(request)
+    try:
+        return service.append_resumable_upload(upload_id, offset, body)
+    except UploadNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except UploadConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except UploadTooLarge as exc:
+        raise HTTPException(status_code=413, detail=str(exc))
+
+
+@app.get("/resumable/uploads")
+def list_resumable_uploads(
+    status: Optional[str] = Query(default=None, description="按状态过滤：open/completed"),
+):
+    """列出续传上传及其确认偏移（可选状态过滤）。"""
+    return {"uploads": service.list_resumable_uploads(status)}
+
+
+@app.get("/resumable/uploads/{upload_id}")
+def get_resumable_upload(upload_id: str):
+    """查进度：已确认偏移、剩余字节、状态；完成后附带首次完成结果。"""
+    try:
+        return service.get_resumable_upload(upload_id)
+    except UploadNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/resumable/uploads/{upload_id}/complete")
+def complete_resumable_upload(upload_id: str):
+    """到齐后核验 SHA-256 与 CSV 规则并一次性发布分区、行索引和完成结果。
+
+    失败不改原分区；同一上传号重复完成（含重启后）幂等返回原结果，
+    不会覆盖后来已经成功的上传。
+    """
+    try:
+        return service.complete_resumable_upload(upload_id)
+    except UploadNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except UploadConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ChecksumMismatch as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except CsvValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except MissingBlobFile as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+async def _read_request_body(request: Request) -> bytes:
+    """读取 octet-stream 请求体；空体也允许（用于零字节探测/幂等重传）。"""
+    chunks = []
+    async for chunk in request.stream():
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 # --------------------------------------------------------------------------- #

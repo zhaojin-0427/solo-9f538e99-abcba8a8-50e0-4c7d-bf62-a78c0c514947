@@ -79,12 +79,37 @@ CREATE TABLE IF NOT EXISTS gc_queue (
     last_error  TEXT
 );
 
+-- 分区“代”计数：每次成功发布（普通上传/续传完成）+1。
+-- 续传创建时记录当时的代，完成时若已变化则拒绝，实现“被成功替换过即过期”。
+CREATE TABLE IF NOT EXISTS partition_generations (
+    partition_id TEXT PRIMARY KEY,
+    generation   INTEGER NOT NULL DEFAULT 0
+);
+
+-- 断点续传上传：已确认偏移与完成结果都在 SQLite 中，重启不丢；
+-- 未确认尾部只存在暂存文件里，不计入 confirmed_bytes。
+CREATE TABLE IF NOT EXISTS resumable_uploads (
+    upload_id          TEXT PRIMARY KEY,
+    partition_id       TEXT NOT NULL,
+    total_bytes        INTEGER NOT NULL,
+    sha256_expected    TEXT NOT NULL,
+    confirmed_bytes    INTEGER NOT NULL DEFAULT 0,
+    created_generation INTEGER NOT NULL DEFAULT 0,
+    status             TEXT NOT NULL DEFAULT 'open',
+    completed_at       TEXT,
+    result_json        TEXT,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_partition_entries_blob
     ON partition_entries(blob_sha);
 CREATE INDEX IF NOT EXISTS idx_snapshot_entries_blob
     ON snapshot_entries(blob_sha);
 CREATE INDEX IF NOT EXISTS idx_leases_blob
     ON download_leases(blob_sha);
+CREATE INDEX IF NOT EXISTS idx_resumable_partition
+    ON resumable_uploads(partition_id);
 """
 
 
@@ -113,6 +138,7 @@ def init_db(cfg: Settings = default_settings) -> None:
     Path(cfg.data_dir).mkdir(parents=True, exist_ok=True)
     cfg.blobs_dir.mkdir(parents=True, exist_ok=True)
     cfg.tmp_dir.mkdir(parents=True, exist_ok=True)
+    cfg.uploads_dir.mkdir(parents=True, exist_ok=True)
     conn = connect(cfg)
     try:
         conn.execute("BEGIN IMMEDIATE;")

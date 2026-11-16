@@ -23,6 +23,8 @@ class Settings:
     db_name: str = field(default_factory=lambda: os.environ.get("DB_NAME", "moisture.db"))
     blobs_dirname: str = "blobs"
     tmp_dirname: str = "tmp"
+    # 续传分片的暂存目录（与 tmp/ 分开：重启不清理，已确认字节必须保留）
+    uploads_dirname: str = "uploads"
     # 下载租约的生命周期保护在进程内完成；此参数仅用于防御性清理
     lease_ttl_seconds: int = field(default_factory=lambda: _env_int("LEASE_TTL_SECONDS", 3600))
     # 触发回收后，遇到正在下载的文件时的重试次数（每次重新校验引用）
@@ -41,6 +43,10 @@ class Settings:
     @property
     def tmp_dir(self) -> Path:
         return self.data_dir / self.tmp_dirname
+
+    @property
+    def uploads_dir(self) -> Path:
+        return self.data_dir / self.uploads_dirname
 
 
 settings = Settings()

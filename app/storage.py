@@ -15,6 +15,22 @@ class UploadTooLarge(Exception):
     """上传字节数超过配置上限。"""
 
 
+class PartialUploadError(Exception):
+    """续传分片写入错误基类。"""
+
+
+class PartialOffsetError(PartialUploadError):
+    """追加偏移越过已确认偏移（跳写），拒绝且不改进度。"""
+
+
+class PartialConflictError(PartialUploadError):
+    """已确认区间收到不同字节（异文重传），拒绝且不改进度。"""
+
+
+class PartialOverrunError(PartialUploadError):
+    """追加结果超过创建时声明的总字节数。"""
+
+
 def blob_path(sha256: str, cfg: Settings = default_settings) -> Path:
     # 两级目录分片，避免单目录文件过多
     return cfg.blobs_dir / sha256[:2] / sha256[2:4] / sha256
@@ -107,3 +123,106 @@ def list_blob_files(cfg: Settings = default_settings):
     if not cfg.blobs_dir.exists():
         return []
     return [p.name for p in cfg.blobs_dir.glob("*/*/*") if p.is_file() and not p.name.startswith(".")]
+
+
+# --------------------------------------------------------------------------- #
+# 断点续传暂存文件
+# --------------------------------------------------------------------------- #
+def partial_path(upload_id: str, cfg: Settings = default_settings) -> Path:
+    """续传暂存文件路径。位于独立 uploads/ 目录，重启不清理。"""
+    return cfg.uploads_dir / f"upload-{upload_id}.part"
+
+
+def create_partial(upload_id: str, cfg: Settings = default_settings) -> Path:
+    """创建空的续传暂存文件（创建上传时调用）。"""
+    cfg.uploads_dir.mkdir(parents=True, exist_ok=True)
+    path = partial_path(upload_id, cfg)
+    # 新建上传不应撞上既有文件；存在则原样保留以免覆盖，交由上层报错
+    with open(path, "xb"):
+        pass
+    return path
+
+
+def append_partial(
+    upload_id: str,
+    offset: int,
+    chunk: bytes,
+    confirmed: int,
+    total_bytes: int,
+    max_upload_bytes: int,
+    cfg: Settings = default_settings,
+    chunk_size: int = 1024 * 1024,
+) -> int:
+    """按偏移把 chunk 追加到暂存文件，返回新的已确认字节数。
+
+    规则（与数据库确认偏移 ``confirmed`` 对照）：
+
+    - ``offset == confirmed``：新字节，校验总长后追加，进度推进；
+    - ``offset < confirmed``：已确认区间重传。重叠部分必须逐字节相同
+      （同字节重传幂等、不重复追加）；若内容不同则拒绝，进度不变；
+      重叠区之后的新字节正常追加；
+    - ``offset > confirmed``：跳写，拒绝，进度不变；
+    - 任何写入都不得超过 ``total_bytes``，亦不得超过全局上传上限。
+
+    整个函数在调用方持有的“单上传串行锁”内执行，无需自己加锁。
+    """
+    if offset < 0:
+        raise PartialOffsetError("offset 不能为负数")
+    if offset > confirmed:
+        raise PartialOffsetError(
+            f"offset {offset} 越过已确认偏移 {confirmed}，不允许跳写"
+        )
+    if not chunk:
+        # 空请求：幂等无操作，进度不变
+        return confirmed
+    # 重叠部分是已确认字节的重传、不会再次落盘；只有其之后的新字节增长文件，
+    # 因此两条上限都按“追加后的最终文件长度”判定。
+    overlap = min(confirmed - offset, len(chunk))
+    new_len = confirmed + (len(chunk) - overlap)
+    if new_len > max_upload_bytes:
+        # 全局上传上限是最外层约束，先于“声明总字节”检查
+        raise UploadTooLarge(f"upload exceeds {max_upload_bytes} bytes")
+    if new_len > total_bytes:
+        raise PartialOverrunError(
+            f"追加后将达到 {new_len} 字节，"
+            f"超过创建时声明的总字节数 {total_bytes}"
+        )
+
+    path = partial_path(upload_id, cfg)
+    if overlap > 0:
+        with open(path, "rb") as verify:
+            verify.seek(offset)
+            remaining = overlap
+            view = memoryview(chunk)
+            pos = 0
+            while remaining > 0:
+                n = min(chunk_size, remaining)
+                existing = verify.read(n)
+                if existing != bytes(view[pos:pos + n]):
+                    raise PartialConflictError(
+                        f"已确认区间 [{offset}, {offset + overlap}) 的字节与重传内容不一致"
+                    )
+                pos += n
+                remaining -= n
+
+    new_bytes = chunk[overlap:]
+    with open(path, "ab") as out:
+        if new_bytes:
+            out.write(new_bytes)
+        out.flush()
+        os.fsync(out.fileno())
+    return new_len
+
+
+def truncate_partial(upload_id: str, confirmed: int, cfg: Settings = default_settings) -> None:
+    """把暂存文件截断到已确认偏移：丢弃重启前未确认的尾部。"""
+    path = partial_path(upload_id, cfg)
+    with open(path, "r+b") as fh:
+        fh.truncate(confirmed)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def discard_partial(upload_id: str, cfg: Settings = default_settings) -> None:
+    """删除续传暂存文件（完成发布后调用），不存在视为已删除。"""
+    partial_path(upload_id, cfg).unlink(missing_ok=True)

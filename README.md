@@ -5,6 +5,11 @@
 共用数据卷文件；作业可固定某一已提交状态的全部分区取得**快照号**按号读取，
 释放后拒绝新读取；回收只删除既不被当前分区也不被未释放快照引用的文件。
 
+此外提供**断点续传上传**：田间数据员经不稳定网络补传单日 CSV 时，先按
+（日期、总字节数、整份 SHA-256）创建上传取得上传号与已确认偏移，随后按
+偏移追加；同字节重传幂等、跳写/异文重传拒绝，断线或进程重启后可从已确认
+偏移接着传，到齐后核验摘要与 CSV 规则再一次性发布分区、行索引和完成结果。
+
 技术栈：**FastAPI + SQLite（WAL）+ 内容寻址文件卷**，单容器、单进程，
 `docker compose` 一键启动。
 
@@ -48,12 +53,41 @@ DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET`  | `/partitions` | 列出所有分区当前版本元数据 |
 | `GET`  | `/partitions/{partition_id}` | 查看单个分区当前版本 |
 | `GET`  | `/partitions/{partition_id}/download[?snapshot_id=N]` | 下载 CSV；带快照号读固定版本 |
+| `POST` | `/resumable/uploads` | 创建续传上传（日期、总字节数、SHA-256），返回上传号与已确认偏移 |
+| `PUT`  | `/resumable/uploads/{id}/content?offset=N` | 按偏移追加原始字节（`application/octet-stream`） |
+| `GET`  | `/resumable/uploads[?status=open\|completed]` | 列出续传上传及确认偏移 |
+| `GET`  | `/resumable/uploads/{id}` | 查单个续传上传的进度/完成结果 |
+| `POST` | `/resumable/uploads/{id}/complete` | 到齐后核验摘要与 CSV，一次性发布分区、行索引和完成结果 |
 | `POST` | `/snapshots` | 固定当前全部分区，返回快照号 |
 | `GET`  | `/snapshots` | 列出快照及释放状态 |
 | `POST` | `/snapshots/{id}/release` | 释放快照，之后拒绝新读取（409） |
 | `POST` | `/gc` | 立即执行一轮回收 |
 | `GET`  | `/gc/status` | 回收队列长度、活动下载数、数据卷文件数 |
 | `GET`  | `/health` | 健康检查 |
+
+以上端点都带请求/响应模型与中文说明，可直接在
+[http://localhost:8000/docs](http://localhost:8000/docs) 创建、续传、查进度
+并完成一次上传。
+
+### 断点续传演示
+
+```bash
+# 1) 创建：声明日期、总字节数和整份 SHA-256，拿到上传号
+SHA=$(sha256sum day.csv | awk '{print $1}')
+SIZE=$(stat -c%s day.csv)
+UID=$(curl -s -X POST localhost:8000/resumable/uploads \
+  -H 'Content-Type: application/json' \
+  -d "{\"partition_id\":\"2026-11-15\",\"total_bytes\":$SIZE,\"sha256\":\"$SHA\"}" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["upload_id"])')
+
+# 2) 按偏移追加（断网/重启后先用 GET 查回已确认偏移，再从该偏移续传）
+curl -s -X PUT "localhost:8000/resumable/uploads/$UID/content?offset=0" \
+  -H 'Content-Type: application/octet-stream' --data-binary @<(head -c 4096 day.csv)
+curl -s "localhost:8000/resumable/uploads/$UID"     # 查进度：confirmed_bytes/remaining_bytes
+
+# 3) 到齐后核验并一次性发布（失败不改原分区；重复完成幂等返回原结果）
+curl -s -X POST "localhost:8000/resumable/uploads/$UID/complete"
+```
 
 ### 典型演示
 
@@ -82,9 +116,10 @@ curl localhost:8000/gc/status
 
 ```
 /data
-├── moisture.db            # SQLite（WAL 模式，外键开启）
-├── blobs/<aa>/<bb>/<sha>  # 内容寻址文件，路径由 SHA-256 分片得到
-└── tmp/upload-*           # 上传临时文件，提交后原子发布，重启即清理
+├── moisture.db              # SQLite（WAL 模式，外键开启）
+├── blobs/<aa>/<bb>/<sha>    # 内容寻址文件，路径由 SHA-256 分片得到
+├── uploads/upload-<id>.part # 续传暂存文件（重启保留，按已确认偏移截断）
+└── tmp/upload-*             # 普通上传临时文件，提交后原子发布，重启即清理
 ```
 
 核心表：
@@ -94,7 +129,10 @@ curl localhost:8000/gc/status
 - `snapshots` / `snapshot_entries`：快照固定的（分区 → blob）映射，
   `released_at` 非空表示已释放；
 - `download_leases`：进行中的下载租约（blob 级），带过期时间；
-- `gc_queue`：待回收 blob 队列，记录尝试次数与最近错误，崩溃后可继续。
+- `gc_queue`：待回收 blob 队列，记录尝试次数与最近错误，崩溃后可继续；
+- `resumable_uploads`：续传上传登记——目标分区、总字节数、声明摘要、
+  **已确认偏移**、创建时代计数、状态（`open`/`completed`）与缓存的完成结果；
+- `partition_generations`：每个分区的成功发布代计数，用于续传的过期判定。
 
 一个 blob 只要被以下任一位置引用就**不可回收**：
 1. 某分区当前版本（`partitions.current_blob` / `partition_entries`）；
@@ -139,6 +177,9 @@ blob。流式响应用 **async 生成器**实现（阻塞读放进 anyio 工作�
 
 ### 5.5 崩溃 / 中断恢复
 - 启动时清理 `tmp/` 残留临时文件；
+- **续传恢复**：`uploads/` 暂存文件不清理；以数据库 `confirmed_bytes` 为唯一
+  权威进度，把每个未完成上传的暂存文件截断到已确认偏移——崩溃前来不及确认的
+  尾部一律丢弃、不计入进度，重启后客户端从该偏移接着传即可；
 - 数据卷对账：磁盘上无登记的文件自动入队；
 - 处理 `gc_queue`：删除失败的文件保留在队列、记录错误，重启继续，
   单文件失败不影响其他文件；
@@ -149,6 +190,30 @@ blob。流式响应用 **async 生成器**实现（阻塞读放进 anyio 工作�
 ### 5.6 同内容重新上传仍可用
 blob 被回收后若再次上传相同字节，会重新走「临时文件 → 原子发布」流程，
 得到同一路径并正常下载；上传时若发现该 SHA 已在回收队列，会自动撤销回收。
+
+### 5.7 断点续传的正确性保证
+- **按偏移追加、重传幂等**：`offset == 已确认偏移` 时追加新字节；`offset`
+  落在已确认区间内时逐字节比对，相同则幂等返回（不重复追加），不同（异文
+  重传）返回 409 且不改进度；`offset > 已确认偏移`（跳写）同样 409。
+- **确认偏移只在事务内推进**：每个上传号有进程内串行锁，配合 `metadata_lock`
+  与 SQLite 事务，保证「读偏移 → 写文件 → 更新偏移」原子可见；并发乱序
+  分块不会产生重复或空洞。
+- **重启不丢已确认字节、未确认尾部不计进度**：已确认字节同时落在
+  `uploads/` 文件与数据库偏移中（写入后 `fsync`）；未确认尾部在启动恢复时
+  被截断（见 5.5）。
+- **未完成不发布**：仅当全部字节到齐、SHA-256 与声明一致、CSV 规则校验通过，
+  才在一个事务里登记 blob、原子发布文件、替换分区与行索引；之前任何时刻
+  分区、快照都看不到该上传的内容。
+- **失败不改原分区**：到齐前拒绝完成、摘要不符（409）或 CSV 不合法（422）
+  都在触碰分区登记之前返回，原分区与行索引保持不变，上传仍是 `open` 可重试。
+- **过期拒绝**：创建上传时记录分区当前代计数；完成时若该日期已被任何成功
+  发布替换过（普通上传或别的续传），代计数变化即拒绝，**即使内容改回原样也
+  拒绝**。其他日期的上传、快照与回收不受影响。
+- **重复完成幂等且不覆盖后来上传**：完成结果（含发布的 SHA、行数等）缓存在
+  `resumable_uploads.result_json`；同一上传号在重启后重复完成只返回首次结果，
+  不会再次发布、更不会覆盖之后已经成功的上传。
+- **沿用既有约束**：续传同样受 `MAX_UPLOAD_BYTES` 限制（创建与追加两处校验），
+  发布后的 blob 进入同一个内容寻址数据卷，遵循原引用与回收规则。
 
 ---
 
@@ -161,6 +226,10 @@ python -m pytest tests/ -q
 
 - `tests/test_api.py`：上传/替换、SHA-256 去重、快照固定/释放、回收规则、
   坏 CSV 不破坏原分区、同内容重新上传；
+- `tests/test_resumable.py`：续传创建/分块完成、同字节重传幂等、跳写与
+  异文重传拒绝且不改进度、超总长/大小限制、摘要不符与坏 CSV 不改原分区、
+  重启保留已确认字节并截断未确认尾部、重复完成幂等不覆盖后来上传、过期
+  拒绝（内容改回仍拒绝）、其他日期/快照/回收共存、真实 uvicorn 并发追加；
 - `tests/test_concurrency.py`：**真实 uvicorn + httpx** 端到端，覆盖慢下载
   反压期间上传/释放/其他文件回收互不阻塞、同字节并发上传去重、并发读写
   快照始终可读、释放后 409；
@@ -176,13 +245,16 @@ python -m pytest tests/ -q
 | `DATA_DIR` | `/data` | 数据库与数据卷根目录 |
 | `LEASE_TTL_SECONDS` | `3600` | 下载租约兜底 TTL |
 | `GC_MAX_PASSES` | `3` | 单次回收对「下载中」文件的重试轮数 |
-| `MAX_UPLOAD_BYTES` | `67108864` | 单文件上传字节上限（64 MiB） |
+| `MAX_UPLOAD_BYTES` | `67108864` | 单文件字节上限（64 MiB），普通上传与续传（创建声明、累计追加）共用 |
 
 ## 8. 部署约束与取舍
 
-- Compose 固定 **单 worker**：下载租约的进程内强引用/计数依赖单进程；
-  SQLite 单库 + WAL 也适配单进程多协程并发。临界区均为短操作，流式 I/O
-  不持锁，吞吐瓶颈在文件与网络而非锁。
+- Compose 固定 **单 worker**：下载租约的进程内强引用/计数、续传的单上传
+  串行锁都依赖单进程；SQLite 单库 + WAL 也适配单进程多协程并发。临界区均为
+  短操作，流式 I/O 不持锁，吞吐瓶颈在文件与网络而非锁。
+- 续传暂存文件与数据库同处命名卷 `/data`，容器重建（`docker compose up`）
+  后已确认偏移与已确认字节都在，可直接续传；只有显式删除命名卷才会丢失。
 - 若要水平扩展为多进程/多主机，需把进程内锁与租约计数下沉到数据库
   （`SELECT ... BEGIN IMMEDIATE` 串行化 + 租约表）或引入分布式锁，
-  当前数据模型已为此预留 `download_leases` 表与 TTL 字段。
+  当前数据模型已为此预留 `download_leases` 表与 TTL 字段；续传的串行锁
+  同样可由「按上传号在事务内读改写确认偏移」的数据库串行化替代。
